@@ -1,6 +1,9 @@
-use std::collections::HashSet;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use rand::Rng;
+use std::fs;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub static DICTIONARY_VEC: OnceLock<Vec<String>> = OnceLock::new();
 
 pub fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -9,96 +12,38 @@ pub fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-pub fn load_dictionary() -> HashSet<String> {
-    let mut dict = HashSet::new();
+pub fn load_dictionary(path: &str) {
+    let mut dict_vec = Vec::new();
 
-    let sample_words = vec![
-        "the",
-        "them",
-        "there",
-        "these",
-        "then",
-        "they",
-        "when",
-        "where",
-        "other",
-        "rather",
-        "either",
-        "whether",
-        "father",
-        "mother",
-        "brother",
-        "gather",
-        "leather",
-        "weather",
-        "feather",
-        "teacher",
-        "preacher",
-        "header",
-        "thread",
-        "breath",
-        "health",
-        "wealth",
-        "stealth",
-        "earth",
-        "north",
-        "south",
-        "mouth",
-        "youth",
-        "truth",
-        "booth",
-        "smooth",
-        "tooth",
-        "growth",
-        "length",
-        "strength",
-        "warmth",
-        "fourth",
-        "their",
-        "think",
-        "thing",
-        "through",
-        "three",
-        "throw",
-        "theory",
-        "theater",
-        "therapy",
-        "thermal",
-        "thunder",
-        "thousand",
-        "thread",
-        "threat",
-        "throne",
-        "throughout",
-        "although",
-        "within",
-        "without",
-        "everything",
-        "something",
-        "nothing",
-        "anything",
-        "everyone",
-        "someone",
-    ];
-
-    for word in sample_words {
-        dict.insert(word.to_string());
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            for line in contents.lines() {
+                let word = line.trim().to_lowercase();
+                dict_vec.push(word);
+            }
+            tracing::info!("Loaded {} words into dictionary", dict_vec.len());
+        }
+        Err(e) => {
+            panic!("Failed to load dictionary from {}: {}", path, e);
+        }
     }
 
-    dict
+    DICTIONARY_VEC.set(dict_vec).unwrap();
 }
 
 pub fn generate_hint_letters() -> String {
-    const COMMON_PAIRS: &[&str] = &[
-        "th", "he", "in", "er", "an", "ed", "nd", "to", "en", "ti", "es", "or", "te", "of", "be",
-        "ha", "as", "hi", "on", "se", "at", "ar", "re", "it", "ng", "al", "st", "le", "is", "ou",
-    ];
-
-    use rand::Rng;
+    let dict = DICTIONARY_VEC.get().expect("Dictionary not loaded");
     let mut rng = rand::rng();
-    COMMON_PAIRS[rng.random_range(0..COMMON_PAIRS.len())].to_string()
+
+    let word = &dict[rng.random_range(0..dict.len())];
+    let hint_length = rng.random_range(2..=3.min(word.len()));
+    let start_pos = rng.random_range(0..=word.len() - hint_length);
+
+    word.chars().skip(start_pos).take(hint_length).collect()
 }
 
-pub fn contains_all_letters(word: &str, hint_letters: &str) -> bool {
-    hint_letters.chars().all(|ch| word.contains(ch))
+pub fn is_valid_guess(word: &str, hint: &str) -> bool {
+    let dict = DICTIONARY_VEC.get().expect("Dictionary not loaded");
+    let word_lc = word.to_lowercase();
+    dict.contains(&word_lc) && word_lc.contains(&hint.to_lowercase())
 }
