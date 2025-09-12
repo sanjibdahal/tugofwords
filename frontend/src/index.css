@@ -5,7 +5,7 @@ body {
   height: 100%;
   margin: 0;
   padding: 0;
-  background-image: url("/background.svg");
+  background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.6)), url("./background.svg");
   background-size: cover;
   background-repeat: no-repeat;
   background-position: center;
@@ -13,6 +13,52 @@ body {
   font-weight: 400;
   font-style: normal;
 
+}
+
+body, input, button, textarea, select, h1, h2, h3, h4, h5, h6, p, label, div {
+  font-family: 'Jersey 10', sans-serif !important;
+  color: white;
+}
+
+h1, h2, h3, h4, h5, h6, p {
+  fontsize: 1.2rem;
+  font-weight: 400;
+}
+p {
+  font-size: 1.5rem;
+}
+span {
+  color: #70B15E;
+}
+
+button, input, textarea, select {
+  font-size: 1.2rem;
+  border-radius: 1rem;
+  border: none;
+  background: rgba(255,255,255,0.08);
+  color: white;
+  padding: 0.8rem 1.2rem;
+  margin: 0.5rem 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+
+button {
+  background: linear-gradient(90deg, #A2C758 0%, #70B15E 100%);
+  cursor: pointer;
+  font-weight: semi-bold;
+  letter-spacing: 1px;
+  transition: transform 0.1s;
+}
+button:hover {
+  transform: scale(1.05);
+}
+
+.centered {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
 }
 
 .ScreenCenterContainer {
