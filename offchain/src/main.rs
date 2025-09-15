@@ -1,6 +1,7 @@
 use crate::{
     consts::ADDR,
-    game::{AppState, Game, GameMessage, GameStatus},
+    game::{AppState, Game, GameMessage, GameStatus, LobbyInfo},
+    utils::load_dictionary,
 };
 use axum::{
     extract::{
@@ -16,7 +17,10 @@ use futures_util::{
     sink::SinkExt,
     stream::{SplitSink, StreamExt},
 };
-use tokio::sync::{broadcast, mpsc::Receiver};
+use tokio::sync::{
+    broadcast,
+    mpsc::{Receiver, Sender},
+};
 use tower_http::cors::CorsLayer;
 
 mod consts;
@@ -26,8 +30,9 @@ mod utils;
 async fn handle_receiver(mut rx: Receiver<GameMessage>, mut sender: SplitSink<WebSocket, Message>) {
     while let Some(msg) = rx.recv().await {
         if let GameMessage::Error { .. } = &msg {
-            let _ = sender.send(Message::Close(None)).await;
-            break;
+            // to make the connection persistent we are not closing the connection on error
+            // let _ = sender.send(Message::Close(None)).await;
+            // break;
         }
 
         if let Ok(json) = serde_json::to_string(&msg)
@@ -61,6 +66,15 @@ async fn forward_game_broadcast(
     }
 }
 
+async fn lobby_broadcast(
+    tx_clone: Sender<GameMessage>,
+    mut lobby_rx: broadcast::Receiver<GameMessage>,
+) {
+    while let Ok(msg) = lobby_rx.recv().await {
+        let _ = tx_clone.send(msg).await;
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (sender, mut receiver) = socket.split();
 
@@ -71,12 +85,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     drop(tokio::spawn(handle_receiver(rx_out, sender)));
 
+    let lobby_rx = state.lobby_tx.subscribe();
+    let tx_clone = tx_out.clone();
+
+    drop(tokio::spawn(lobby_broadcast(tx_clone, lobby_rx)));
     // Handle incoming messages
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(game_msg) = serde_json::from_str::<GameMessage>(&text) {
                     match game_msg {
+                        GameMessage::Lobby { .. } => {
+                            let games: Vec<LobbyInfo> = state
+                                .games
+                                .iter()
+                                .map(|entry| LobbyInfo {
+                                    game_id: entry.id.clone(),
+                                    creator: entry.creator.clone(),
+                                    round: entry.max_rounds,
+                                })
+                                .collect();
+                            let _ = state.lobby_tx.send(GameMessage::Lobby { games });
+                        }
                         GameMessage::CreateGame {
                             player_id: pid,
                             rounds,
@@ -88,7 +118,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             tokio::spawn(async move {
                                 forward_game_broadcast(game_rx, tx_clone).await;
                             });
-
+                            game.broadcast_state();
                             state.games.insert(game_id.clone(), game);
 
                             current_game_id = Some(game_id.clone());
@@ -102,6 +132,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 })
                                 .await;
 
+                            // update in the lobby list
+                            let games: Vec<LobbyInfo> = state
+                                .games
+                                .iter()
+                                .map(|entry| LobbyInfo {
+                                    game_id: entry.id.clone(),
+                                    creator: entry.creator.clone(),
+                                    round: entry.max_rounds,
+                                })
+                                .collect();
+                            let _ = state.lobby_tx.send(GameMessage::Lobby { games });
+
                             tracing::info!("Game {} created by: {:?}", game_id, player_id)
                         }
 
@@ -114,18 +156,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     Ok(()) => {
                                         current_game_id = Some(game_id.clone());
                                         player_id = Some(pid.clone());
+
                                         let rx = game.tx.subscribe();
+                                        game.broadcast_state();
+
                                         let tx_clone = tx_out.clone();
                                         tokio::spawn(async move {
                                             forward_game_broadcast(rx, tx_clone).await;
                                         });
-                                        let _ = tx_out
-                                            .send(GameMessage::JoinGame {
-                                                game_id,
-                                                player_id: pid,
-                                            })
-                                            .await;
 
+                                        game.broadcast_state();
                                         tracing::info!(
                                             "Game {:?} joined by: {:?}",
                                             current_game_id,
@@ -149,22 +189,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         GameMessage::SubmitWord { word } => {
                             if let (Some(game_id), Some(player)) = (&current_game_id, &player_id) {
                                 if let Some(mut game) = state.games.get_mut(game_id) {
+                                    tracing::info!(
+                                        "{:?}{:?} : {:?}",
+                                        current_game_id,
+                                        player_id,
+                                        word
+                                    );
                                     match game.submit_word(player, word) {
-                                        Ok(Some(result)) => {
-                                            // Broadcast round result
-                                            let _ = game.tx.send(GameMessage::RoundResult {
-                                                result: result.clone(),
-                                            });
-
-                                            if game.state.status == GameStatus::Finished {
-                                                let winner = game.get_winner();
-                                                let _ = game.tx.send(GameMessage::GameEnd {
-                                                    winner,
-                                                    final_state: game.state.clone(),
-                                                });
-                                            } else {
-                                                game.broadcast_state();
-                                            }
+                                        Ok(Some(_result)) => {
+                                            game.check_n_broadcast_finish();
+                                            game.broadcast_state();
                                         }
                                         Ok(None) => {
                                             // this in theory is not possible
@@ -197,33 +231,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if let Some((_, mut game)) = state.games.remove(&game_id) {
             let disconnected_player = player_id.unwrap_or("Unknown".to_string());
 
-            let winner = if disconnected_player == game.creator {
-                game.joiner.clone()
-            } else {
-                Some(game.creator.clone())
-            };
-
             game.state.status = GameStatus::Finished;
+            game.check_n_broadcast_finish();
 
-            if winner.is_some() {
-                let game_end_msg = GameMessage::GameEnd {
-                    winner: winner.clone(),
-                    final_state: game.state.clone(),
-                };
-                let _ = game.tx.send(game_end_msg);
-
-                let disconnect_msg = GameMessage::Error {
-                    message: format!("{} disconnected. You win by default!", disconnected_player),
-                };
-                let _ = game.tx.send(disconnect_msg);
-            }
-
-            tracing::info!(
-                "Player {} disconnected from game {}. Winner: {:?}",
-                disconnected_player,
-                game_id,
-                winner
-            );
+            tracing::info!("Player {} disconnected from game", disconnected_player,);
         }
     }
 }
@@ -234,7 +245,9 @@ async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respons
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
-    let state = AppState::new();
+    let (lobby_tx, _lobby_rx) = broadcast::channel(100);
+    load_dictionary("words.txt");
+    let state = AppState::new(lobby_tx);
 
     // build our application with a single route
     let app = Router::new()

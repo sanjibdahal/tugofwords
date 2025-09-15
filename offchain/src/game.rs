@@ -1,16 +1,12 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::utils::contains_all_letters;
-use crate::utils::current_timestamp;
-use crate::utils::generate_hint_letters;
-use crate::utils::load_dictionary;
+use crate::utils::{current_timestamp, generate_hint_letters, is_valid_guess};
 
-use crate::consts::ROPE_WIN_THRESHOLD;
+use crate::utils::DICTIONARY_VEC;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GameState {
@@ -42,55 +38,42 @@ pub struct RoundResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LobbyInfo {
+    pub game_id: String,
+    pub creator: String,
+    pub round: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum GameMessage {
-    JoinGame {
-        game_id: String,
-        player_id: String,
-    },
-    CreateGame {
-        player_id: String,
-        rounds: u8,
-    },
-    SubmitWord {
-        word: String,
-    },
-    GameCreated {
-        game_id: String,
-        player_id: String,
-    },
-    PlayerJoined {
-        player_id: String,
-    },
-    GameState {
-        state: GameState,
-    },
-    RoundResult {
-        result: RoundResult,
-    },
-    GameEnd {
-        winner: Option<String>,
-        final_state: GameState,
-    },
-    Error {
-        message: String,
-    },
+    Lobby { games: Vec<LobbyInfo> },
+    JoinGame { game_id: String, player_id: String },
+    CreateGame { player_id: String, rounds: u8 },
+    SubmitWord { word: String },
+    GameCreated { game_id: String, player_id: String },
+    PlayerJoined { player_id: String },
+    GameState { state: GameState },
+    RoundResult { result: RoundResult },
+    GameFinish { player_id: String, score: i8 },
+    Error { message: String },
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub games: Arc<DashMap<String, Game>>,
+    pub lobby_tx: broadcast::Sender<GameMessage>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(lobby_tx: broadcast::Sender<GameMessage>) -> Self {
         Self {
             games: Arc::new(DashMap::new()),
+            lobby_tx,
         }
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct Game {
     pub id: String,
     pub max_rounds: u8,
@@ -98,7 +81,6 @@ pub struct Game {
     pub joiner: Option<String>,
     pub state: GameState,
     pub tx: broadcast::Sender<GameMessage>,
-    pub dictionary: Arc<HashSet<String>>,
 }
 
 impl Game {
@@ -106,7 +88,6 @@ impl Game {
         let game_id = Uuid::new_v4().to_string()[..8].to_string();
         let hint_letters = generate_hint_letters();
         let (tx, _) = broadcast::channel(100);
-
         let state = GameState {
             game_id: game_id.clone(),
             creator: creator.clone(),
@@ -127,13 +108,15 @@ impl Game {
             joiner: None,
             state,
             tx,
-            dictionary: Arc::new(load_dictionary()),
         }
     }
 
     pub fn add_joiner(&mut self, joiner: String) -> Result<(), String> {
         if self.joiner.is_some() {
             return Err("Game is full".to_string());
+        }
+        if joiner == self.creator {
+            return Err("Cannot be joined by the creator!".to_string());
         }
 
         self.joiner = Some(joiner.clone());
@@ -165,11 +148,11 @@ impl Game {
 
         let word_lower = word.to_lowercase();
 
-        if !self.dictionary.contains(&word_lower) {
-            return Err("Word not in dictionary".to_string());
+        if !DICTIONARY_VEC.get().unwrap().contains(&word_lower) {
+            return Err(format!("Word not in dictionary {}", word_lower));
         }
 
-        if !contains_all_letters(&word_lower, &self.state.hint_letters) {
+        if !is_valid_guess(&word_lower, &self.state.hint_letters) {
             return Err(format!(
                 "Word must contain all hint letters: {}",
                 self.state.hint_letters
@@ -199,9 +182,7 @@ impl Game {
             new_rope_position: self.state.rope_position,
         };
 
-        if self.state.rope_position.abs() >= ROPE_WIN_THRESHOLD
-            || self.state.current_round >= self.max_rounds
-        {
+        if self.state.current_round > self.max_rounds - 1 {
             self.state.status = GameStatus::Finished;
             return Ok(Some(result));
         }
@@ -223,17 +204,23 @@ impl Game {
         });
     }
 
-    pub fn get_winner(&self) -> Option<String> {
-        if self.state.status != GameStatus::Finished {
-            return None;
-        }
+    pub fn check_n_broadcast_finish(&self) {
+        if self.state.status == GameStatus::Finished {
+            let mut winner = String::from("Draw");
+            if self.state.rope_position > 0 {
+                winner = self.state.creator.clone();
+            }
 
-        if self.state.rope_position > 0 {
-            Some(self.state.creator.clone())
-        } else if self.state.rope_position < 0 {
-            self.state.joiner.clone()
-        } else {
-            None
+            if let Some(p) = &self.state.joiner
+                && self.state.rope_position < 0
+            {
+                winner = p.to_string();
+            }
+
+            let _ = self.tx.send(GameMessage::GameFinish {
+                player_id: winner,
+                score: self.state.rope_position,
+            });
         }
     }
 }
